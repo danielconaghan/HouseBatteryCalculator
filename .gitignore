@@ -1,0 +1,24 @@
+# Environment files — never commit secrets
+.env
+*.env.local
+
+# Laravel
+*/vendor/
+*/bootstrap/cache/*
+*/storage/logs/*
+*/storage/framework/cache/*
+*/storage/framework/sessions/*
+*/storage/framework/views/*
+!*/storage/*/.gitkeep
+
+# React / Node
+energy-ui/node_modules/
+energy-ui/dist/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp

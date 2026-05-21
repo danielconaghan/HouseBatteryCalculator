@@ -1,0 +1,142 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # energy-service — optimisation engine, external API integrations
+  # http://localhost:8001
+  # ---------------------------------------------------------------------------
+  energy-service:
+    build:
+      context: ./energy-service
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./energy-service:/var/www/html
+      - /var/www/html/vendor
+    environment:
+      APP_ENV: local
+      APP_KEY: ${ENERGY_SERVICE_APP_KEY}
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: energy_service
+      DB_USERNAME: sail
+      DB_PASSWORD: password
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - solar
+
+  # ---------------------------------------------------------------------------
+  # energy-bff — backend for frontend, auth, aggregation
+  # http://localhost:8002
+  # ---------------------------------------------------------------------------
+  energy-bff:
+    build:
+      context: ./energy-bff
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./energy-bff:/var/www/html
+      - /var/www/html/vendor
+    environment:
+      APP_ENV: local
+      APP_KEY: ${ENERGY_BFF_APP_KEY}
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: energy_bff
+      DB_USERNAME: sail
+      DB_PASSWORD: password
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      ENERGY_SERVICE_URL: http://energy-service:8000
+      SANCTUM_STATEFUL_DOMAINS: localhost:3000
+      FRONTEND_URL: http://localhost:3000
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      energy-service:
+        condition: service_started
+    networks:
+      - solar
+
+  # ---------------------------------------------------------------------------
+  # energy-ui — React SPA (development server with HMR)
+  # http://localhost:3000
+  # ---------------------------------------------------------------------------
+  energy-ui:
+    build:
+      context: ./energy-ui
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./energy-ui:/app
+      - /app/node_modules
+    environment:
+      VITE_BFF_URL: http://localhost:8002
+    depends_on:
+      - energy-bff
+    networks:
+      - solar
+
+  # ---------------------------------------------------------------------------
+  # Shared MySQL 8 instance — separate databases per service
+  # host port 3307 to avoid conflicts with a local MySQL
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_USER: sail
+      MYSQL_PASSWORD: password
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "sail", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - solar
+
+  # ---------------------------------------------------------------------------
+  # Shared Redis 7
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - solar
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  solar:
+    driver: bridge
