@@ -16,13 +16,12 @@ use Carbon\Carbon;
  */
 class CalculateChargeRecommendationAction
 {
-    private const float CLOUD_COVER_THRESHOLD_PCT       = 60.0;
-    private const float CLOUD_COVER_CONFIDENCE_PENALTY  = 0.2;
-    private const float DIVERGENCE_THRESHOLD            = 0.3;
-    private const float DIVERGENCE_CONFIDENCE_PENALTY   = 0.2;
-    private const float VARIANCE_THRESHOLD              = 0.4;
-    private const float VARIANCE_CONFIDENCE_PENALTY     = 0.15;
-    private const int   VALIDITY_HOURS                  = 8;
+    private const float CLOUD_COVER_THRESHOLD_PCT      = 60.0;
+    private const float CLOUD_COVER_CONFIDENCE_PENALTY = 0.2;
+    private const float VARIANCE_THRESHOLD             = 0.4;
+    private const float VARIANCE_CONFIDENCE_PENALTY    = 0.15;
+    private const float STALENESS_CONFIDENCE_PENALTY   = 0.3;
+    private const int   VALIDITY_HOURS                 = 8;
 
     public function __construct(
         private readonly float $batteryCeilingKwh,
@@ -38,21 +37,21 @@ class CalculateChargeRecommendationAction
         [$targetPct, $targetKwh] = $this->calculateTarget($action, $input, $chargeGap);
 
         $reasoning = new ReasoningDTO(
-            forecast_generation_kwh: $input->forecast_generation_kwh,
+            forecast_generation_kwh:  $input->forecast_generation_kwh,
             forecast_consumption_kwh: $input->forecast_consumption_kwh,
-            current_battery_kwh: $input->current_battery_kwh,
-            gap_kwh: $chargeGap,
-            factors: $this->buildFactors($input, $chargeGap),
+            current_battery_kwh:      $input->current_battery_kwh,
+            gap_kwh:                  $chargeGap,
+            factors:                  $this->buildFactors($input, $chargeGap),
         );
 
         return new RecommendationDTO(
-            action: $action,
+            action:            $action,
             target_charge_pct: $targetPct,
             target_charge_kwh: $targetKwh,
-            confidence: $confidence,
-            reasoning: $reasoning,
-            generated_at: Carbon::now(),
-            valid_until: Carbon::now()->addHours(self::VALIDITY_HOURS),
+            confidence:        $confidence,
+            reasoning:         $reasoning,
+            generated_at:      Carbon::now(),
+            valid_until:       Carbon::now()->addHours(self::VALIDITY_HOURS),
         );
     }
 
@@ -77,9 +76,9 @@ class CalculateChargeRecommendationAction
     }
 
     private function calculateTarget(
-        RecommendationAction $action,
+        RecommendationAction  $action,
         RecommendationInputDTO $input,
-        float $chargeGap,
+        float                 $chargeGap,
     ): array {
         return match ($action) {
             RecommendationAction::DoNotCharge => [
@@ -108,12 +107,13 @@ class CalculateChargeRecommendationAction
             $confidence -= self::CLOUD_COVER_CONFIDENCE_PENALTY;
         }
 
-        if ($input->generation_forecast_divergence > self::DIVERGENCE_THRESHOLD) {
-            $confidence -= self::DIVERGENCE_CONFIDENCE_PENALTY;
-        }
-
         if ($input->consumption_variance_coefficient > self::VARIANCE_THRESHOLD) {
             $confidence -= self::VARIANCE_CONFIDENCE_PENALTY;
+        }
+
+        // Proportional penalty: each stale data source (~0.33) contributes up to 0.3 total
+        if ($input->data_staleness_factor > 0.0) {
+            $confidence -= $input->data_staleness_factor * self::STALENESS_CONFIDENCE_PENALTY;
         }
 
         return max(0.0, round($confidence, 2));
@@ -131,15 +131,15 @@ class CalculateChargeRecommendationAction
             );
         }
 
-        if ($input->generation_forecast_divergence > self::DIVERGENCE_THRESHOLD) {
-            $factors[] = sprintf(
-                'Forecast.solar and Open-Meteo diverge by %.0f%% — confidence reduced',
-                $input->generation_forecast_divergence * 100,
-            );
-        }
-
         if ($input->consumption_variance_coefficient > self::VARIANCE_THRESHOLD) {
             $factors[] = 'High consumption variance for this day/season — confidence reduced';
+        }
+
+        if ($input->data_staleness_factor > 0.0) {
+            $factors[] = sprintf(
+                'Input data is stale (factor: %.0f%%) — confidence reduced',
+                $input->data_staleness_factor * 100,
+            );
         }
 
         return $factors;

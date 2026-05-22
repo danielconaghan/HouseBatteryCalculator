@@ -4,355 +4,202 @@ declare(strict_types=1);
 
 namespace Tests\Unit\Services;
 
-use App\DTOs\ForecastSolar\SolarArrayDTO;
-use App\DTOs\ForecastSolar\SolarForecastDTO;
 use App\DTOs\Octopus\ConsumptionReadingDTO;
-use App\DTOs\OpenMeteo\WeatherForecastDTO;
+use App\DTOs\Solar\DailySolarForecastDTO;
 use App\DTOs\Solax\BatteryStateDTO;
-use App\Exceptions\OctopusApiException;
-use App\Services\Contracts\ForecastSolarClientInterface;
-use App\Services\Contracts\OctopusClientInterface;
-use App\Services\Contracts\OpenMeteoClientInterface;
-use App\Services\Contracts\SolaxClientInterface;
+use App\Repositories\Contracts\BatteryReadingRepositoryInterface;
+use App\Repositories\Contracts\ConsumptionReadingRepositoryInterface;
+use App\Repositories\Contracts\SolarForecastRepositoryInterface;
 use App\Services\RecommendationInputAssembler;
 use Carbon\Carbon;
-use Mockery;
-use Mockery\MockInterface;
-use Tests\TestCase;
+use PHPUnit\Framework\MockObject\MockObject;
+use PHPUnit\Framework\TestCase;
 
 class RecommendationInputAssemblerTest extends TestCase
 {
-    private SolaxClientInterface&MockInterface         $solax;
-    private OctopusClientInterface&MockInterface       $octopus;
-    private ForecastSolarClientInterface&MockInterface $forecastSolar;
-    private OpenMeteoClientInterface&MockInterface     $openMeteo;
-
-    private SolarArrayDTO $array1;
-    private SolarArrayDTO $array2;
+    private BatteryReadingRepositoryInterface&MockObject     $batteryRepo;
+    private SolarForecastRepositoryInterface&MockObject      $forecastRepo;
+    private ConsumptionReadingRepositoryInterface&MockObject $consumptionRepo;
+    private RecommendationInputAssembler                     $assembler;
 
     protected function setUp(): void
     {
         parent::setUp();
 
-        Carbon::setTestNow('2026-01-15 21:00:00'); // Thursday
+        $this->batteryRepo     = $this->createMock(BatteryReadingRepositoryInterface::class);
+        $this->forecastRepo    = $this->createMock(SolarForecastRepositoryInterface::class);
+        $this->consumptionRepo = $this->createMock(ConsumptionReadingRepositoryInterface::class);
 
-        $this->solax         = Mockery::mock(SolaxClientInterface::class);
-        $this->octopus       = Mockery::mock(OctopusClientInterface::class);
-        $this->forecastSolar = Mockery::mock(ForecastSolarClientInterface::class);
-        $this->openMeteo     = Mockery::mock(OpenMeteoClientInterface::class);
-
-        $this->array1 = new SolarArrayDTO(name: 'South', kwp: 2.0, azimuth: 181, tilt: 35);
-        $this->array2 = new SolarArrayDTO(name: 'East',  kwp: 2.0, azimuth: 90,  tilt: 35);
-    }
-
-    protected function tearDown(): void
-    {
-        Carbon::setTestNow();
-        Mockery::close();
-        parent::tearDown();
-    }
-
-    /** @test */
-    public function it_assembles_a_recommendation_input_dto_from_all_clients(): void
-    {
-        $date = Carbon::parse('2026-01-15');
-
-        $this->solax->expects('getBatteryState')->andReturn(
-            $this->makeBatteryState(charge_kwh: 3.0, charge_pct: 37)
-        );
-
-        $this->forecastSolar->expects('getDailyForecast')
-            ->with($this->array1, Mockery::type(Carbon::class))
-            ->andReturn($this->makeSolarForecast($this->array1, 5.0));
-
-        $this->forecastSolar->expects('getDailyForecast')
-            ->with($this->array2, Mockery::type(Carbon::class))
-            ->andReturn($this->makeSolarForecast($this->array2, 7.0));
-
-        $this->openMeteo->expects('getDailyForecast')
-            ->andReturn($this->makeWeatherForecast($date, cloud_cover: 30.0, radiation: 20.0));
-
-        $this->octopus->expects('getHalfHourlyConsumption')
-            ->andReturn($this->makeThursdayReadings());
-
-        $result = $this->makeAssembler()->assemble($date);
-
-        $this->assertEqualsWithDelta(3.0,  $result->current_battery_kwh,     0.001);
-        $this->assertSame(37,              $result->current_battery_pct);
-        $this->assertEqualsWithDelta(12.0, $result->forecast_generation_kwh,  0.001); // 5 + 7
-        $this->assertEqualsWithDelta(11.0, $result->forecast_consumption_kwh, 0.001); // mean(10,12,11)
-        $this->assertEqualsWithDelta(30.0, $result->cloud_cover_pct,          0.001);
-    }
-
-    /** @test */
-    public function it_sums_generation_across_all_arrays(): void
-    {
-        $date = Carbon::parse('2026-01-15');
-
-        $this->stubSolax();
-        $this->stubOctopus();
-        $this->stubOpenMeteo($date);
-
-        $this->forecastSolar->expects('getDailyForecast')
-            ->with($this->array1, Mockery::any())
-            ->andReturn($this->makeSolarForecast($this->array1, 3.5));
-
-        $this->forecastSolar->expects('getDailyForecast')
-            ->with($this->array2, Mockery::any())
-            ->andReturn($this->makeSolarForecast($this->array2, 4.5));
-
-        $result = $this->makeAssembler()->assemble($date);
-
-        $this->assertEqualsWithDelta(8.0, $result->forecast_generation_kwh, 0.001);
-    }
-
-    /** @test */
-    public function it_filters_consumption_to_matching_day_of_week_only(): void
-    {
-        $date = Carbon::parse('2026-01-15'); // Thursday
-
-        $this->stubSolax();
-        $this->stubForecastSolar($date);
-        $this->stubOpenMeteo($date);
-
-        // Mix of Thursdays and Wednesdays — Wednesdays must be excluded from mean
-        $readings = array_merge(
-            $this->makeReadingsForDate('2026-01-08', 10.0), // Thursday ✓
-            $this->makeReadingsForDate('2026-01-07', 20.0), // Wednesday ✗
-            $this->makeReadingsForDate('2026-01-01', 12.0), // Thursday ✓
-            $this->makeReadingsForDate('2025-12-31', 30.0), // Wednesday ✗
-        );
-
-        $this->octopus->expects('getHalfHourlyConsumption')->andReturn($readings);
-
-        $result = $this->makeAssembler()->assemble($date);
-
-        // mean([10.0, 12.0]) = 11.0 — Wednesday readings excluded
-        $this->assertEqualsWithDelta(11.0, $result->forecast_consumption_kwh, 0.001);
-    }
-
-    /** @test */
-    public function it_computes_sample_variance_coefficient_from_same_day_totals(): void
-    {
-        $date = Carbon::parse('2026-01-15'); // Thursday
-
-        $this->stubSolax();
-        $this->stubForecastSolar($date);
-        $this->stubOpenMeteo($date);
-
-        // [10, 12, 11] → mean=11, sample std dev=1.0, CV = 1/11 ≈ 0.0909
-        $this->octopus->expects('getHalfHourlyConsumption')
-            ->andReturn($this->makeThursdayReadings());
-
-        $result = $this->makeAssembler()->assemble($date);
-
-        $this->assertEqualsWithDelta(round(1.0 / 11.0, 4), $result->consumption_variance_coefficient, 0.0001);
-    }
-
-    /** @test */
-    public function variance_coefficient_is_zero_for_a_single_data_point(): void
-    {
-        $date = Carbon::parse('2026-01-15'); // Thursday
-
-        $this->stubSolax();
-        $this->stubForecastSolar($date);
-        $this->stubOpenMeteo($date);
-
-        $this->octopus->expects('getHalfHourlyConsumption')
-            ->andReturn($this->makeReadingsForDate('2026-01-08', 10.0)); // one Thursday only
-
-        $result = $this->makeAssembler()->assemble($date);
-
-        $this->assertEqualsWithDelta(0.0, $result->consumption_variance_coefficient, 0.0001);
-    }
-
-    /** @test */
-    public function it_computes_generation_divergence_against_open_meteo_implied_kwh(): void
-    {
-        $date        = Carbon::parse('2026-01-15');
-        $totalKwp    = 4.0;
-        $radiationMj = 20.0;
-        $forecastKwh = 5.0;
-
-        $this->stubSolax();
-        $this->stubOctopus();
-
-        $this->forecastSolar->allows('getDailyForecast')
-            ->andReturn($this->makeSolarForecast($this->array1, $forecastKwh));
-
-        $this->openMeteo->expects('getDailyForecast')
-            ->andReturn($this->makeWeatherForecast($date, cloud_cover: 0.0, radiation: $radiationMj));
-
-        $result = $this->makeAssembler(totalKwp: $totalKwp, arrays: [$this->array1])->assemble($date);
-
-        $impliedKwh = $radiationMj * 0.2778 * $totalKwp * 0.75;
-        $expected   = round(abs($forecastKwh - $impliedKwh) / max($forecastKwh, $impliedKwh), 4);
-
-        $this->assertEqualsWithDelta($expected, $result->generation_forecast_divergence, 0.0001);
-    }
-
-    /** @test */
-    public function divergence_is_zero_when_both_sources_produce_zero(): void
-    {
-        $date = Carbon::parse('2026-01-15');
-
-        $this->stubSolax();
-        $this->stubOctopus();
-
-        $this->forecastSolar->allows('getDailyForecast')
-            ->andReturn($this->makeSolarForecast($this->array1, 0.0));
-
-        $this->openMeteo->expects('getDailyForecast')
-            ->andReturn($this->makeWeatherForecast($date, cloud_cover: 0.0, radiation: 0.0));
-
-        $result = $this->makeAssembler(totalKwp: 4.0, arrays: [$this->array1])->assemble($date);
-
-        $this->assertEqualsWithDelta(0.0, $result->generation_forecast_divergence, 0.0001);
-    }
-
-    /** @test */
-    public function it_throws_octopus_exception_when_no_consumption_data_matches_day_of_week(): void
-    {
-        $date = Carbon::parse('2026-01-15'); // Thursday
-
-        $this->stubSolax();
-        $this->stubForecastSolar($date);
-        $this->stubOpenMeteo($date);
-
-        // Only Wednesday readings — assembler must throw because no Thursdays exist
-        $this->octopus->expects('getHalfHourlyConsumption')
-            ->andReturn($this->makeReadingsForDate('2026-01-07', 10.0));
-
-        $this->expectException(OctopusApiException::class);
-
-        $this->makeAssembler()->assemble($date);
-    }
-
-    /** @test */
-    public function it_passes_the_correct_date_range_to_octopus(): void
-    {
-        $date = Carbon::parse('2026-01-15');
-
-        $this->stubSolax();
-        $this->stubForecastSolar($date);
-        $this->stubOpenMeteo($date);
-
-        $this->octopus->expects('getHalfHourlyConsumption')
-            ->withArgs(function (Carbon $from, Carbon $to): bool {
-                // 6 weeks before 2026-01-15 = 2025-12-04, start of day
-                // day before 2026-01-15     = 2026-01-14, end of day
-                return $from->toDateString() === '2025-12-04'
-                    && $to->toDateString()   === '2026-01-14';
-            })
-            ->andReturn($this->makeThursdayReadings());
-
-        $this->makeAssembler()->assemble($date);
-    }
-
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
-
-    private function makeAssembler(float $totalKwp = 4.0, ?array $arrays = null): RecommendationInputAssembler
-    {
-        return new RecommendationInputAssembler(
-            solax:         $this->solax,
-            octopus:       $this->octopus,
-            forecastSolar: $this->forecastSolar,
-            openMeteo:     $this->openMeteo,
-            solarArrays:   $arrays ?? [$this->array1, $this->array2],
-            totalKwp:      $totalKwp,
+        $this->assembler = new RecommendationInputAssembler(
+            batteryRepo:     $this->batteryRepo,
+            forecastRepo:    $this->forecastRepo,
+            consumptionRepo: $this->consumptionRepo,
         );
     }
 
-    private function makeBatteryState(float $charge_kwh = 3.0, int $charge_pct = 37): BatteryStateDTO
+    public function test_assembles_from_fresh_repository_data(): void
     {
+        $forecastDate = Carbon::tomorrow();
+
+        $this->batteryRepo->method('latest')->willReturn($this->battery(chargeKwh: 5.0, chargePct: 43));
+        $this->forecastRepo->method('forDate')->willReturn($this->forecast(estimatedKwh: 12.0, cloudCoverPct: 30));
+        $this->consumptionRepo->method('getSince')->willReturn($this->consumptionWeek($forecastDate, 8.0));
+
+        $input = $this->assembler->assemble($forecastDate);
+
+        $this->assertEqualsWithDelta(5.0, $input->current_battery_kwh, 0.001);
+        $this->assertSame(43, $input->current_battery_pct);
+        $this->assertEqualsWithDelta(12.0, $input->forecast_generation_kwh, 0.001);
+        $this->assertEqualsWithDelta(8.0, $input->forecast_consumption_kwh, 0.5);
+        $this->assertEqualsWithDelta(30.0, $input->cloud_cover_pct, 0.001);
+        $this->assertEqualsWithDelta(0.0, $input->data_staleness_factor, 0.01);
+    }
+
+    public function test_uses_zero_battery_when_no_reading_exists(): void
+    {
+        $this->batteryRepo->method('latest')->willReturn(null);
+        $this->forecastRepo->method('forDate')->willReturn($this->forecast());
+        $this->consumptionRepo->method('getSince')->willReturn([]);
+
+        $input = $this->assembler->assemble(Carbon::tomorrow());
+
+        $this->assertSame(0.0, $input->current_battery_kwh);
+        $this->assertSame(0, $input->current_battery_pct);
+    }
+
+    public function test_uses_zero_generation_when_no_forecast_exists(): void
+    {
+        $this->batteryRepo->method('latest')->willReturn($this->battery());
+        $this->forecastRepo->method('forDate')->willReturn(null);
+        $this->consumptionRepo->method('getSince')->willReturn([]);
+
+        $input = $this->assembler->assemble(Carbon::tomorrow());
+
+        $this->assertSame(0.0, $input->forecast_generation_kwh);
+    }
+
+    public function test_uses_default_consumption_when_no_history_exists(): void
+    {
+        $this->batteryRepo->method('latest')->willReturn($this->battery());
+        $this->forecastRepo->method('forDate')->willReturn($this->forecast());
+        $this->consumptionRepo->method('getSince')->willReturn([]);
+
+        $input = $this->assembler->assemble(Carbon::tomorrow());
+
+        $this->assertEqualsWithDelta(10.0, $input->forecast_consumption_kwh, 0.001);
+    }
+
+    public function test_staleness_factor_increases_for_stale_battery(): void
+    {
+        $staleAt = Carbon::now()->subMinutes(45);
+        $this->batteryRepo->method('latest')->willReturn($this->battery(fetchedAt: $staleAt));
+        $this->forecastRepo->method('forDate')->willReturn($this->forecast());
+        $this->consumptionRepo->method('getSince')->willReturn([]);
+
+        $input = $this->assembler->assemble(Carbon::tomorrow());
+
+        $this->assertGreaterThan(0.0, $input->data_staleness_factor);
+    }
+
+    public function test_staleness_factor_zero_when_all_data_fresh(): void
+    {
+        $forecastDate = Carbon::tomorrow();
+        $this->batteryRepo->method('latest')->willReturn($this->battery());
+        $this->forecastRepo->method('forDate')->willReturn($this->forecast());
+        $this->consumptionRepo->method('getSince')->willReturn($this->consumptionWeek($forecastDate, 8.0));
+
+        $input = $this->assembler->assemble($forecastDate);
+
+        $this->assertEqualsWithDelta(0.0, $input->data_staleness_factor, 0.01);
+    }
+
+    public function test_staleness_maxes_at_one_when_all_sources_missing(): void
+    {
+        $this->batteryRepo->method('latest')->willReturn(null);
+        $this->forecastRepo->method('forDate')->willReturn(null);
+        $this->consumptionRepo->method('getSince')->willReturn([]);
+
+        $input = $this->assembler->assemble(Carbon::tomorrow());
+
+        $this->assertEqualsWithDelta(1.0, $input->data_staleness_factor, 0.01);
+    }
+
+    public function test_cloud_cover_defaults_to_100_when_no_forecast(): void
+    {
+        $this->batteryRepo->method('latest')->willReturn($this->battery());
+        $this->forecastRepo->method('forDate')->willReturn(null);
+        $this->consumptionRepo->method('getSince')->willReturn([]);
+
+        $input = $this->assembler->assemble(Carbon::tomorrow());
+
+        $this->assertSame(100.0, $input->cloud_cover_pct);
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    private function battery(
+        float   $chargeKwh = 4.0,
+        int     $chargePct = 35,
+        ?Carbon $fetchedAt = null,
+    ): BatteryStateDTO {
         return new BatteryStateDTO(
-            charge_pct:          $charge_pct,
-            charge_kwh:          $charge_kwh,
+            charge_pct:          $chargePct,
+            charge_kwh:          $chargeKwh,
             bat_power_w:         null,
             inverter_status:     null,
-            inverter_status_raw: '',
-            fetched_at:          Carbon::now(),
+            inverter_status_raw: '102',
+            fetched_at:          $fetchedAt ?? Carbon::now(),
         );
     }
 
-    private function makeSolarForecast(SolarArrayDTO $array, float $kwh): SolarForecastDTO
-    {
-        return new SolarForecastDTO(
-            array:                $array,
-            forecast_kwh:         $kwh,
-            date:                 Carbon::parse('2026-01-15')->startOfDay(),
-            watt_hours_by_period: [],
-        );
-    }
-
-    private function makeWeatherForecast(Carbon $date, float $cloud_cover, float $radiation): WeatherForecastDTO
-    {
-        return new WeatherForecastDTO(
-            cloud_cover_pct:        $cloud_cover,
-            shortwave_radiation_mj: $radiation,
-            date:                   $date->startOfDay()->clone(),
+    private function forecast(
+        float $estimatedKwh  = 10.0,
+        ?int  $cloudCoverPct = 20,
+    ): DailySolarForecastDTO {
+        return new DailySolarForecastDTO(
+            forecast_date:    Carbon::tomorrow(),
+            estimated_kwh:    $estimatedKwh,
+            radiation_kwh_m2: 3.5,
+            cloud_cover_pct:  $cloudCoverPct,
+            generated_at:     Carbon::now(),
         );
     }
 
     /**
-     * Three Thursdays within the 6-week window: 10 kWh, 12 kWh, 11 kWh.
-     * Mean = 11.0; sample std dev = 1.0; CV = 1/11 ≈ 0.0909.
+     * Generates one historical day's worth of half-hourly readings matching
+     * $forecastDate's day-of-week, plus a recent reading to mark the job as
+     * having run within the staleness window.
      *
      * @return ConsumptionReadingDTO[]
      */
-    private function makeThursdayReadings(): array
+    private function consumptionWeek(Carbon $forecastDate, float $dailyKwh): array
     {
-        return array_merge(
-            $this->makeReadingsForDate('2026-01-08', 10.0),
-            $this->makeReadingsForDate('2026-01-01', 12.0),
-            $this->makeReadingsForDate('2025-12-25', 11.0),
-        );
-    }
+        $readings   = [];
+        $halfHourly = $dailyKwh / 48;
+        $targetDow  = $forecastDate->dayOfWeek;
 
-    /**
-     * Single half-hour reading representing the full day's consumption.
-     * This is sufficient because aggregateDailyConsumption sums by date key.
-     *
-     * @return ConsumptionReadingDTO[]
-     */
-    private function makeReadingsForDate(string $date, float $totalKwh): array
-    {
-        $start = Carbon::parse($date)->startOfDay()->setTimezone('Europe/London');
+        $day = $forecastDate->copy()->subWeek()->startOfDay();
+        while ($day->dayOfWeek !== $targetDow) {
+            $day->addDay();
+        }
 
-        return [
-            new ConsumptionReadingDTO(
-                consumption_kwh: $totalKwh,
+        for ($i = 0; $i < 48; $i++) {
+            $start      = $day->copy()->addMinutes($i * 30);
+            $readings[] = new ConsumptionReadingDTO(
+                consumption_kwh: $halfHourly,
                 interval_start:  $start,
-                interval_end:    $start->copy()->addDay(),
-            ),
-        ];
-    }
+                interval_end:    $start->copy()->addMinutes(30),
+            );
+        }
 
-    // -------------------------------------------------------------------------
-    // Stubs (lenient allows — use when the test cares about other things)
-    // -------------------------------------------------------------------------
+        // A recent reading confirms the job ran within the staleness window
+        $recentStart = Carbon::now()->subMinutes(90);
+        $readings[]  = new ConsumptionReadingDTO(
+            consumption_kwh: $halfHourly,
+            interval_start:  $recentStart,
+            interval_end:    $recentStart->copy()->addMinutes(30),
+        );
 
-    private function stubSolax(): void
-    {
-        $this->solax->allows('getBatteryState')->andReturn($this->makeBatteryState());
-    }
-
-    private function stubOctopus(): void
-    {
-        $this->octopus->allows('getHalfHourlyConsumption')->andReturn($this->makeThursdayReadings());
-    }
-
-    private function stubForecastSolar(Carbon $date): void
-    {
-        $this->forecastSolar->allows('getDailyForecast')
-            ->andReturn($this->makeSolarForecast($this->array1, 5.0));
-    }
-
-    private function stubOpenMeteo(Carbon $date): void
-    {
-        $this->openMeteo->allows('getDailyForecast')
-            ->andReturn($this->makeWeatherForecast($date, cloud_cover: 30.0, radiation: 20.0));
+        return $readings;
     }
 }

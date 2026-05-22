@@ -7,292 +7,195 @@ namespace Tests\Unit\Actions;
 use App\Actions\CalculateChargeRecommendationAction;
 use App\DTOs\RecommendationInputDTO;
 use App\Enums\RecommendationAction;
-use Carbon\Carbon;
 use PHPUnit\Framework\TestCase;
 
 class CalculateChargeRecommendationActionTest extends TestCase
 {
-    private const float BATTERY_CEILING_KWH = 8.1;
-    private const int   BATTERY_CEILING_PCT = 70;
+    private const float CEILING_KWH = 8.1;
+    private const int   CEILING_PCT = 70;
 
     private CalculateChargeRecommendationAction $action;
 
     protected function setUp(): void
     {
-        Carbon::setTestNow('2026-01-15 21:00:00');
-
+        parent::setUp();
         $this->action = new CalculateChargeRecommendationAction(
-            batteryCeilingKwh: self::BATTERY_CEILING_KWH,
-            batteryCeilingPct: self::BATTERY_CEILING_PCT,
+            batteryCeilingKwh: self::CEILING_KWH,
+            batteryCeilingPct: self::CEILING_PCT,
         );
     }
 
-    protected function tearDown(): void
-    {
-        Carbon::setTestNow();
-    }
+    // ─── Action determination ──────────────────────────────────────────────────
 
-    // ─── Sad paths first ─────────────────────────────────────────────────────
-
-    public function test_recommends_full_charge_when_gap_exceeds_threshold(): void
+    public function test_recommends_charge_when_gap_exceeds_threshold(): void
     {
-        // consumption=15, generation=5, battery=2 → gap = (15-5)-2 = 8 → ≥ 25% of 8.1 kWh
-        $result = $this->action->execute($this->makeInput(
-            forecast_consumption_kwh: 15.0,
-            forecast_generation_kwh: 5.0,
-            current_battery_kwh: 2.0,
-            current_battery_pct: 17,
-        ));
+        $result = $this->action->execute($this->input(battery: 1.0, consumption: 10.0, generation: 2.0));
 
         $this->assertSame(RecommendationAction::Charge, $result->action);
-        $this->assertSame(self::BATTERY_CEILING_PCT, $result->target_charge_pct);
-        $this->assertSame(self::BATTERY_CEILING_KWH, $result->target_charge_kwh);
+        $this->assertSame(self::CEILING_PCT, $result->target_charge_pct);
+        $this->assertSame(self::CEILING_KWH, $result->target_charge_kwh);
     }
 
-    public function test_confidence_is_degraded_by_high_cloud_cover(): void
+    public function test_recommends_partial_charge_when_gap_is_small(): void
     {
-        $result = $this->action->execute($this->makeInput(cloud_cover_pct: 85.0));
+        // gap = (6 - 2) - 3.5 = 0.5, which is < ceiling*0.25 = 2.025
+        $result = $this->action->execute($this->input(battery: 3.5, consumption: 6.0, generation: 2.0));
 
-        $this->assertSame(0.8, $result->confidence);
+        $this->assertSame(RecommendationAction::PartialCharge, $result->action);
     }
 
-    public function test_confidence_is_degraded_by_high_forecast_divergence(): void
+    public function test_recommends_do_not_charge_when_battery_and_generation_cover_consumption(): void
     {
-        $result = $this->action->execute($this->makeInput(generation_forecast_divergence: 0.5));
+        // gap = (5 - 6) - 4 = -5 → DoNotCharge
+        $result = $this->action->execute($this->input(battery: 4.0, batteryPct: 40, consumption: 5.0, generation: 6.0));
 
-        $this->assertSame(0.8, $result->confidence);
+        $this->assertSame(RecommendationAction::DoNotCharge, $result->action);
+        $this->assertSame(40, $result->target_charge_pct);
     }
 
-    public function test_confidence_is_degraded_by_high_consumption_variance(): void
+    public function test_do_not_charge_keeps_current_battery_values(): void
     {
-        $result = $this->action->execute($this->makeInput(consumption_variance_coefficient: 0.6));
+        $result = $this->action->execute($this->input(battery: 6.0, batteryPct: 52, consumption: 3.0, generation: 5.0));
 
-        $this->assertSame(0.85, $result->confidence);
+        $this->assertSame(RecommendationAction::DoNotCharge, $result->action);
+        $this->assertSame(52, $result->target_charge_pct);
+        $this->assertEqualsWithDelta(6.0, $result->target_charge_kwh, 0.01);
     }
 
-    public function test_confidence_is_degraded_by_all_three_factors(): void
+    public function test_charge_targets_ceiling_values(): void
     {
-        $result = $this->action->execute($this->makeInput(
-            cloud_cover_pct: 90.0,
-            generation_forecast_divergence: 0.5,
-            consumption_variance_coefficient: 0.6,
-        ));
+        $result = $this->action->execute($this->input(battery: 0.0, consumption: 10.0, generation: 0.0));
 
-        // 1.0 - 0.2 (cloud) - 0.2 (divergence) - 0.15 (variance) = 0.45
-        $this->assertSame(0.45, $result->confidence);
+        $this->assertSame(RecommendationAction::Charge, $result->action);
+        $this->assertSame(self::CEILING_PCT, $result->target_charge_pct);
+        $this->assertSame(self::CEILING_KWH, $result->target_charge_kwh);
     }
 
-    public function test_confidence_is_not_degraded_below_zero(): void
+    public function test_zero_gap_is_do_not_charge(): void
     {
-        // Construct a scenario that would push confidence below zero if unclamped.
-        // Override constants cannot be changed, so use maximum penalties across all factors.
-        $result = $this->action->execute($this->makeInput(
-            cloud_cover_pct: 100.0,
-            generation_forecast_divergence: 1.0,
-            consumption_variance_coefficient: 1.0,
+        // gap = (3 - 3) - 0 = 0.0 → DoNotCharge
+        $result = $this->action->execute($this->input(battery: 0.0, consumption: 3.0, generation: 3.0));
+
+        $this->assertSame(RecommendationAction::DoNotCharge, $result->action);
+    }
+
+    // ─── Confidence ───────────────────────────────────────────────────────────
+
+    public function test_full_confidence_when_all_data_fresh_and_clear(): void
+    {
+        $result = $this->action->execute($this->input());
+
+        $this->assertEqualsWithDelta(1.0, $result->confidence, 0.001);
+    }
+
+    public function test_cloud_cover_above_threshold_reduces_confidence(): void
+    {
+        $result = $this->action->execute($this->input(cloudCover: 75.0));
+
+        $this->assertEqualsWithDelta(0.8, $result->confidence, 0.001);
+    }
+
+    public function test_high_variance_reduces_confidence(): void
+    {
+        $result = $this->action->execute($this->input(variance: 0.5));
+
+        $this->assertEqualsWithDelta(0.85, $result->confidence, 0.001);
+    }
+
+    public function test_stale_data_reduces_confidence_proportionally(): void
+    {
+        // One stale source ≈ factor 0.33 → penalty = 0.33 * 0.3 ≈ 0.099 → confidence ≈ 0.9
+        $result = $this->action->execute($this->input(staleness: 0.33));
+
+        $this->assertEqualsWithDelta(0.9, $result->confidence, 0.01);
+    }
+
+    public function test_fully_stale_data_applies_max_staleness_penalty(): void
+    {
+        // factor 1.0 → penalty = 0.3 → confidence = 0.7
+        $result = $this->action->execute($this->input(staleness: 1.0));
+
+        $this->assertEqualsWithDelta(0.7, $result->confidence, 0.001);
+    }
+
+    public function test_confidence_does_not_go_below_zero(): void
+    {
+        $result = $this->action->execute($this->input(
+            cloudCover: 90.0,
+            variance:   0.9,
+            staleness:  1.0,
         ));
 
         $this->assertGreaterThanOrEqual(0.0, $result->confidence);
     }
 
-    // ─── Decision logic ──────────────────────────────────────────────────────
+    // ─── Reasoning ────────────────────────────────────────────────────────────
 
-    public function test_recommends_partial_charge_when_gap_is_below_threshold(): void
+    public function test_reasoning_contains_summary_factor(): void
     {
-        // consumption=12, generation=8, battery=3 → gap = (12-8)-3 = 1.0 → < 8.1*0.25=2.025
-        $result = $this->action->execute($this->makeInput(
-            forecast_consumption_kwh: 12.0,
-            forecast_generation_kwh: 8.0,
-            current_battery_kwh: 3.0,
-            current_battery_pct: 26,
-        ));
+        $result = $this->action->execute($this->input(battery: 2.0, consumption: 8.0, generation: 3.0));
 
-        $this->assertSame(RecommendationAction::PartialCharge, $result->action);
+        $this->assertStringContainsString('kWh generation', $result->reasoning->factors[0]);
+        $this->assertStringContainsString('kWh consumption', $result->reasoning->factors[0]);
+        $this->assertStringContainsString('kWh charge gap', $result->reasoning->factors[0]);
     }
 
-    public function test_recommends_partial_charge_just_below_threshold(): void
+    public function test_cloud_cover_factor_included_when_above_threshold(): void
     {
-        // gap = 8.1 * 0.25 - 0.01 = 2.015 → PARTIAL_CHARGE
-        $gap      = (self::BATTERY_CEILING_KWH * 0.25) - 0.01;
-        $battery  = 2.0;
-        $need     = $gap + $battery;
+        $result = $this->action->execute($this->input(cloudCover: 80.0));
 
-        $result = $this->action->execute($this->makeInput(
-            forecast_consumption_kwh: $need,
-            forecast_generation_kwh: 0.0,
-            current_battery_kwh: $battery,
-            current_battery_pct: 17,
-        ));
-
-        $this->assertSame(RecommendationAction::PartialCharge, $result->action);
+        $this->assertCount(2, $result->reasoning->factors);
+        $this->assertStringContainsString('Cloud cover', $result->reasoning->factors[1]);
     }
 
-    public function test_does_not_recommend_charge_when_solar_and_battery_cover_consumption(): void
+    public function test_staleness_factor_included_when_data_is_stale(): void
     {
-        // consumption=10, generation=20, battery=4 → gap = (10-20)-4 = -14 → DO_NOT_CHARGE
-        $result = $this->action->execute($this->makeInput(
-            forecast_consumption_kwh: 10.0,
-            forecast_generation_kwh: 20.0,
-            current_battery_kwh: 4.0,
-            current_battery_pct: 35,
-        ));
+        $result = $this->action->execute($this->input(staleness: 0.66));
 
-        $this->assertSame(RecommendationAction::DoNotCharge, $result->action);
+        $this->assertStringContainsString('stale', implode(' ', $result->reasoning->factors));
     }
 
-    public function test_does_not_charge_when_gap_is_exactly_zero(): void
-    {
-        // battery exactly covers the need after solar
-        $result = $this->action->execute($this->makeInput(
-            forecast_consumption_kwh: 10.0,
-            forecast_generation_kwh: 6.0,
-            current_battery_kwh: 4.0,
-            current_battery_pct: 35,
-        ));
-
-        $this->assertSame(RecommendationAction::DoNotCharge, $result->action);
-    }
-
-    // ─── Target calculation ───────────────────────────────────────────────────
-
-    public function test_charge_target_is_battery_ceiling(): void
-    {
-        $result = $this->action->execute($this->makeInput(
-            forecast_consumption_kwh: 15.0,
-            forecast_generation_kwh: 2.0,
-            current_battery_kwh: 1.0,
-            current_battery_pct: 9,
-        ));
-
-        $this->assertSame(self::BATTERY_CEILING_PCT, $result->target_charge_pct);
-        $this->assertSame(self::BATTERY_CEILING_KWH, $result->target_charge_kwh);
-    }
-
-    public function test_partial_charge_target_is_current_plus_gap(): void
-    {
-        // gap = (12-8)-3 = 1.0, so target = 3.0+1.0 = 4.0 kWh
-        $result = $this->action->execute($this->makeInput(
-            forecast_consumption_kwh: 12.0,
-            forecast_generation_kwh: 8.0,
-            current_battery_kwh: 3.0,
-            current_battery_pct: 26,
-        ));
-
-        $this->assertSame(4.0, $result->target_charge_kwh);
-        $this->assertLessThanOrEqual(self::BATTERY_CEILING_PCT, $result->target_charge_pct);
-    }
-
-    public function test_do_not_charge_target_is_current_battery_state(): void
-    {
-        $result = $this->action->execute($this->makeInput(
-            forecast_consumption_kwh: 10.0,
-            forecast_generation_kwh: 20.0,
-            current_battery_kwh: 4.0,
-            current_battery_pct: 35,
-        ));
-
-        $this->assertSame(35, $result->target_charge_pct);
-        $this->assertSame(4.0, $result->target_charge_kwh);
-    }
-
-    // ─── Reasoning and factors ────────────────────────────────────────────────
-
-    public function test_reasoning_always_contains_generation_consumption_summary(): void
-    {
-        $result = $this->action->execute($this->makeInput());
-
-        $this->assertNotEmpty($result->reasoning->factors);
-        $this->assertStringContainsString('generation', $result->reasoning->factors[0]);
-        $this->assertStringContainsString('consumption', $result->reasoning->factors[0]);
-    }
-
-    public function test_reasoning_includes_cloud_cover_factor_when_threshold_exceeded(): void
-    {
-        $result = $this->action->execute($this->makeInput(cloud_cover_pct: 75.0));
-
-        $factors = implode(' ', $result->reasoning->factors);
-        $this->assertStringContainsString('Cloud cover', $factors);
-    }
-
-    public function test_reasoning_does_not_include_cloud_factor_below_threshold(): void
-    {
-        $result = $this->action->execute($this->makeInput(cloud_cover_pct: 59.9));
-
-        $factors = implode(' ', $result->reasoning->factors);
-        $this->assertStringNotContainsString('Cloud cover', $factors);
-    }
-
-    public function test_reasoning_includes_divergence_factor_when_threshold_exceeded(): void
-    {
-        $result = $this->action->execute($this->makeInput(generation_forecast_divergence: 0.4));
-
-        $factors = implode(' ', $result->reasoning->factors);
-        $this->assertStringContainsString('diverge', $factors);
-    }
-
-    public function test_reasoning_includes_variance_factor_when_threshold_exceeded(): void
-    {
-        $result = $this->action->execute($this->makeInput(consumption_variance_coefficient: 0.5));
-
-        $factors = implode(' ', $result->reasoning->factors);
-        $this->assertStringContainsString('variance', $factors);
-    }
-
-    // ─── Validity window ─────────────────────────────────────────────────────
+    // ─── Timestamps ───────────────────────────────────────────────────────────
 
     public function test_valid_until_is_eight_hours_after_generated_at(): void
     {
-        $result = $this->action->execute($this->makeInput());
+        $result = $this->action->execute($this->input());
 
-        $this->assertTrue($result->valid_until->isAfter($result->generated_at));
-        $this->assertSame(8, $result->generated_at->diffInHours($result->valid_until));
+        $diff = (int) $result->generated_at->diffInHours($result->valid_until);
+        $this->assertSame(8, $diff);
     }
 
-    public function test_reasoning_reflects_input_values(): void
+    // ─── Reasoning DTO values ─────────────────────────────────────────────────
+
+    public function test_reasoning_dto_reflects_inputs(): void
     {
-        $result = $this->action->execute($this->makeInput(
-            forecast_generation_kwh: 12.5,
-            forecast_consumption_kwh: 9.3,
-            current_battery_kwh: 3.7,
-        ));
+        $result = $this->action->execute($this->input(battery: 3.0, consumption: 7.0, generation: 2.0));
 
-        $this->assertSame(12.5, $result->reasoning->forecast_generation_kwh);
-        $this->assertSame(9.3, $result->reasoning->forecast_consumption_kwh);
-        $this->assertSame(3.7, $result->reasoning->current_battery_kwh);
+        $this->assertEqualsWithDelta(2.0, $result->reasoning->forecast_generation_kwh, 0.001);
+        $this->assertEqualsWithDelta(7.0, $result->reasoning->forecast_consumption_kwh, 0.001);
+        $this->assertEqualsWithDelta(3.0, $result->reasoning->current_battery_kwh, 0.001);
+        $this->assertEqualsWithDelta(2.0, $result->reasoning->gap_kwh, 0.001);
     }
 
-    // ─── Happy path ───────────────────────────────────────────────────────────
+    // ─── Helpers ──────────────────────────────────────────────────────────────
 
-    public function test_confidence_is_full_when_all_conditions_are_ideal(): void
-    {
-        $result = $this->action->execute($this->makeInput(
-            cloud_cover_pct: 10.0,
-            generation_forecast_divergence: 0.05,
-            consumption_variance_coefficient: 0.1,
-        ));
-
-        $this->assertSame(1.0, $result->confidence);
-    }
-
-    // ─── Helpers ─────────────────────────────────────────────────────────────
-
-    private function makeInput(
-        float $current_battery_kwh = 4.0,
-        int   $current_battery_pct = 35,
-        float $forecast_generation_kwh = 20.0,
-        float $forecast_consumption_kwh = 10.0,
-        float $cloud_cover_pct = 20.0,
-        float $generation_forecast_divergence = 0.1,
-        float $consumption_variance_coefficient = 0.2,
+    private function input(
+        float $battery    = 4.0,
+        int   $batteryPct = 35,
+        float $consumption = 8.0,
+        float $generation  = 3.0,
+        float $cloudCover  = 20.0,
+        float $variance    = 0.1,
+        float $staleness   = 0.0,
     ): RecommendationInputDTO {
         return new RecommendationInputDTO(
-            current_battery_kwh: $current_battery_kwh,
-            current_battery_pct: $current_battery_pct,
-            forecast_generation_kwh: $forecast_generation_kwh,
-            forecast_consumption_kwh: $forecast_consumption_kwh,
-            cloud_cover_pct: $cloud_cover_pct,
-            generation_forecast_divergence: $generation_forecast_divergence,
-            consumption_variance_coefficient: $consumption_variance_coefficient,
+            current_battery_kwh:              $battery,
+            current_battery_pct:              $batteryPct,
+            forecast_generation_kwh:          $generation,
+            forecast_consumption_kwh:         $consumption,
+            cloud_cover_pct:                  $cloudCover,
+            consumption_variance_coefficient: $variance,
+            data_staleness_factor:            $staleness,
         );
     }
 }

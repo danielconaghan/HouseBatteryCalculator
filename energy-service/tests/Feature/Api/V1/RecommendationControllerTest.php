@@ -6,7 +6,6 @@ namespace Tests\Feature\Api\V1;
 
 use App\DTOs\RecommendationInputDTO;
 use App\Enums\RecommendationAction;
-use App\Exceptions\ForecastSolarApiException;
 use App\Exceptions\OctopusApiException;
 use App\Exceptions\OpenMeteoApiException;
 use App\Exceptions\SolaxApiException;
@@ -59,7 +58,7 @@ class RecommendationControllerTest extends TestCase
             ])
             ->assertJsonPath('data.action',            RecommendationAction::DoNotCharge->value)
             ->assertJsonPath('data.target_charge_pct', 37)
-            ->assertJsonPath('data.confidence',        1.0);
+            ->assertJsonPath('data.confidence',        1);
     }
 
     /** @test */
@@ -89,18 +88,6 @@ class RecommendationControllerTest extends TestCase
     }
 
     /** @test */
-    public function it_returns_503_with_forecast_error_code_when_forecast_solar_is_unavailable(): void
-    {
-        $this->mock(RecommendationInputAssembler::class)
-            ->expects('assemble')
-            ->andThrow(new ForecastSolarApiException('Rate limited'));
-
-        $this->getJson('/api/v1/recommendation')
-            ->assertServiceUnavailable()
-            ->assertJsonPath('error.code', 'FORECAST_UNAVAILABLE');
-    }
-
-    /** @test */
     public function it_returns_503_with_weather_error_code_when_open_meteo_is_unavailable(): void
     {
         $this->mock(RecommendationInputAssembler::class)
@@ -112,9 +99,7 @@ class RecommendationControllerTest extends TestCase
             ->assertJsonPath('error.code', 'WEATHER_UNAVAILABLE');
     }
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
+    // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /**
      * Input that drives a DoNotCharge recommendation with full confidence:
@@ -129,8 +114,8 @@ class RecommendationControllerTest extends TestCase
             forecast_generation_kwh:          12.0,
             forecast_consumption_kwh:         8.0,
             cloud_cover_pct:                  20.0,
-            generation_forecast_divergence:   0.1,
             consumption_variance_coefficient: 0.05,
+            data_staleness_factor:            0.0,
         );
     }
 }

@@ -4,96 +4,59 @@ declare(strict_types=1);
 
 namespace App\Services;
 
-use App\DTOs\ForecastSolar\SolarArrayDTO;
-use App\DTOs\ForecastSolar\SolarForecastDTO;
 use App\DTOs\Octopus\ConsumptionReadingDTO;
 use App\DTOs\RecommendationInputDTO;
-use App\Exceptions\OctopusApiException;
-use App\Services\Contracts\ForecastSolarClientInterface;
-use App\Services\Contracts\OctopusClientInterface;
-use App\Services\Contracts\OpenMeteoClientInterface;
-use App\Services\Contracts\SolaxClientInterface;
+use App\DTOs\Solar\DailySolarForecastDTO;
+use App\DTOs\Solax\BatteryStateDTO;
+use App\Repositories\Contracts\BatteryReadingRepositoryInterface;
+use App\Repositories\Contracts\ConsumptionReadingRepositoryInterface;
+use App\Repositories\Contracts\SolarForecastRepositoryInterface;
 use Carbon\Carbon;
 
 class RecommendationInputAssembler
 {
-    /**
-     * How many weeks of same-day-of-week history to fetch from Octopus.
-     * 6 weeks balances seasonal relevance against statistical noise.
-     */
-    private const int   HISTORY_WEEKS     = 6;
+    /** How many weeks of same-day-of-week history to use for consumption estimate */
+    private const int HISTORY_WEEKS = 6;
 
-    /**
-     * Performance ratio used when converting Open-Meteo horizontal irradiance
-     * (MJ/m²) to implied AC generation. 0.75 is a conservative real-world
-     * figure that accounts for angle losses, temperature, and inverter efficiency.
-     * Used only for the divergence comparison, not for generation forecasting.
-     */
-    private const float PERFORMANCE_RATIO = 0.75;
+    /** Default daily consumption (kWh) used when no history is available */
+    private const float DEFAULT_CONSUMPTION_KWH = 10.0;
 
-    /** @param SolarArrayDTO[] $solarArrays */
+    private const int   BATTERY_STALE_MINUTES = 30;
+    private const int   SOLAR_STALE_HOURS     = 25;
+    private const int   CONSUMPTION_STALE_HOURS = 3;
+
     public function __construct(
-        private readonly SolaxClientInterface         $solax,
-        private readonly OctopusClientInterface       $octopus,
-        private readonly ForecastSolarClientInterface $forecastSolar,
-        private readonly OpenMeteoClientInterface     $openMeteo,
-        private readonly array                        $solarArrays,
-        private readonly float                        $totalKwp,
+        private readonly BatteryReadingRepositoryInterface     $batteryRepo,
+        private readonly SolarForecastRepositoryInterface      $forecastRepo,
+        private readonly ConsumptionReadingRepositoryInterface $consumptionRepo,
     ) {}
 
     public function assemble(Carbon $forecastDate): RecommendationInputDTO
     {
-        $battery        = $this->solax->getBatteryState();
-        $arrayForecasts = $this->fetchArrayForecasts($forecastDate);
-        $generationKwh  = $this->sumGenerationKwh($arrayForecasts);
-        $weather        = $this->openMeteo->getDailyForecast($forecastDate);
-        $history        = $this->fetchHistoricalConsumption($forecastDate);
-        $dailyTotals    = $this->aggregateDailyConsumption($history, $forecastDate);
-        $consumptionKwh = $this->mean($dailyTotals);
+        $battery     = $this->batteryRepo->latest();
+        $forecast    = $this->forecastRepo->forDate($forecastDate);
+        $history     = $this->consumptionRepo->getSince(
+            $forecastDate->copy()->subWeeks(self::HISTORY_WEEKS)->startOfDay(),
+        );
 
-        $divergence = $this->generationDivergence($generationKwh, $weather->shortwave_radiation_mj);
-        $variance   = $this->varianceCoefficient($dailyTotals, $consumptionKwh);
+        $dailyTotals    = $this->aggregateDailyConsumption($history, $forecastDate);
+        $consumptionKwh = $this->meanOrDefault($dailyTotals);
+        $variance       = $this->varianceCoefficient($dailyTotals, $consumptionKwh);
+        $staleness      = $this->computeStaleness($battery, $forecast, $history);
 
         return new RecommendationInputDTO(
-            current_battery_kwh:              $battery->charge_kwh,
-            current_battery_pct:              $battery->charge_pct,
-            forecast_generation_kwh:          $generationKwh,
+            current_battery_kwh:              $battery?->charge_kwh          ?? 0.0,
+            current_battery_pct:              $battery?->charge_pct           ?? 0,
+            forecast_generation_kwh:          $forecast?->estimated_kwh       ?? 0.0,
             forecast_consumption_kwh:         $consumptionKwh,
-            cloud_cover_pct:                  $weather->cloud_cover_pct,
-            generation_forecast_divergence:   $divergence,
+            cloud_cover_pct:                  (float) ($forecast?->cloud_cover_pct ?? 100),
             consumption_variance_coefficient: $variance,
-        );
-    }
-
-    /** @return SolarForecastDTO[] */
-    private function fetchArrayForecasts(Carbon $date): array
-    {
-        return array_map(
-            fn (SolarArrayDTO $array) => $this->forecastSolar->getDailyForecast($array, $date),
-            $this->solarArrays,
-        );
-    }
-
-    /** @param SolarForecastDTO[] $forecasts */
-    private function sumGenerationKwh(array $forecasts): float
-    {
-        return round(
-            array_sum(array_map(fn (SolarForecastDTO $f) => $f->forecast_kwh, $forecasts)),
-            3,
-        );
-    }
-
-    /** @return ConsumptionReadingDTO[] */
-    private function fetchHistoricalConsumption(Carbon $forecastDate): array
-    {
-        return $this->octopus->getHalfHourlyConsumption(
-            $forecastDate->copy()->subWeeks(self::HISTORY_WEEKS)->startOfDay(),
-            $forecastDate->copy()->subDay()->endOfDay(),
+            data_staleness_factor:            $staleness,
         );
     }
 
     /**
-     * Groups half-hourly readings by date, filters to dates whose day-of-week
+     * Groups half-hourly readings by date, keeps only dates whose day-of-week
      * matches $forecastDate, and returns an array of daily kWh totals.
      *
      * @param  ConsumptionReadingDTO[] $readings
@@ -108,7 +71,7 @@ class RecommendationInputAssembler
             if ($reading->interval_start->dayOfWeek !== $targetDayOfWeek) {
                 continue;
             }
-            $key         = $reading->interval_start->toDateString();
+            $key          = $reading->interval_start->toDateString();
             $byDate[$key] = ($byDate[$key] ?? 0.0) + $reading->consumption_kwh;
         }
 
@@ -116,13 +79,10 @@ class RecommendationInputAssembler
     }
 
     /** @param float[] $dailyTotals */
-    private function mean(array $dailyTotals): float
+    private function meanOrDefault(array $dailyTotals): float
     {
         if (empty($dailyTotals)) {
-            throw new OctopusApiException(
-                'Cannot compute forecast consumption: no historical data found for the '.
-                'past '.self::HISTORY_WEEKS.' weeks matching this day of week.',
-            );
+            return self::DEFAULT_CONSUMPTION_KWH;
         }
 
         return array_sum($dailyTotals) / count($dailyTotals);
@@ -130,7 +90,7 @@ class RecommendationInputAssembler
 
     /**
      * Sample coefficient of variation: std_dev / mean.
-     * Returns 0.0 when fewer than two data points exist (variance is undefined).
+     * Returns 0.0 when fewer than two data points exist.
      *
      * @param float[] $dailyTotals
      */
@@ -146,22 +106,30 @@ class RecommendationInputAssembler
         return round($stdDev / $mean, 4);
     }
 
-    /**
-     * Normalised divergence between Forecast.solar and Open-Meteo implied generation.
-     * Open-Meteo gives horizontal irradiance; we convert to implied AC output using
-     * total kWp and a performance ratio (see PERFORMANCE_RATIO constant).
-     * This is a rough comparison — we check broad agreement, not precision.
-     */
-    private function generationDivergence(float $forecastSolarKwh, float $radiationMj): float
-    {
-        // 1 MJ/m² = 0.2778 kWh/m²; multiply by kWp and PR for implied AC output.
-        $impliedKwh = $radiationMj * 0.2778 * $this->totalKwp * self::PERFORMANCE_RATIO;
-        $max        = max($forecastSolarKwh, $impliedKwh);
+    private function computeStaleness(
+        ?BatteryStateDTO       $battery,
+        ?DailySolarForecastDTO $forecast,
+        array                  $consumptionReadings,
+    ): float {
+        $factor = 0.0;
 
-        if ($max <= 0.0) {
-            return 0.0;
+        if ($battery === null || $battery->fetched_at->isBefore(now()->subMinutes(self::BATTERY_STALE_MINUTES))) {
+            $factor += 0.33;
         }
 
-        return round(abs($forecastSolarKwh - $impliedKwh) / $max, 4);
+        if ($forecast === null || $forecast->generated_at->isBefore(now()->subHours(self::SOLAR_STALE_HOURS))) {
+            $factor += 0.33;
+        }
+
+        if (empty($consumptionReadings)) {
+            $factor += 0.34;
+        } else {
+            $latest = end($consumptionReadings);
+            if ($latest->interval_end->isBefore(now()->subHours(self::CONSUMPTION_STALE_HOURS))) {
+                $factor += 0.34;
+            }
+        }
+
+        return round(min($factor, 1.0), 2);
     }
 }

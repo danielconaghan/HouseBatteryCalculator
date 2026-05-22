@@ -5,12 +5,15 @@ declare(strict_types=1);
 namespace App\Providers;
 
 use App\Actions\CalculateChargeRecommendationAction;
-use App\DTOs\ForecastSolar\SolarArrayDTO;
-use App\Services\Contracts\ForecastSolarClientInterface;
+use App\Repositories\BatteryReadingRepository;
+use App\Repositories\ConsumptionReadingRepository;
+use App\Repositories\Contracts\BatteryReadingRepositoryInterface;
+use App\Repositories\Contracts\ConsumptionReadingRepositoryInterface;
+use App\Repositories\Contracts\SolarForecastRepositoryInterface;
+use App\Repositories\SolarForecastRepository;
 use App\Services\Contracts\OctopusClientInterface;
 use App\Services\Contracts\OpenMeteoClientInterface;
 use App\Services\Contracts\SolaxClientInterface;
-use App\Services\ForecastSolarClient;
 use App\Services\OctopusClient;
 use App\Services\OpenMeteoClient;
 use App\Services\RecommendationInputAssembler;
@@ -22,9 +25,9 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->bindAction();
+        $this->bindRepositories();
         $this->bindSolaxClient();
         $this->bindOctopusClient();
-        $this->bindForecastSolarClient();
         $this->bindOpenMeteoClient();
         $this->bindRecommendationInputAssembler();
     }
@@ -43,6 +46,13 @@ class AppServiceProvider extends ServiceProvider
                 batteryCeilingPct: (int)   config('battery.charge_ceiling_pct'),
             ),
         );
+    }
+
+    private function bindRepositories(): void
+    {
+        $this->app->bind(BatteryReadingRepositoryInterface::class, BatteryReadingRepository::class);
+        $this->app->bind(SolarForecastRepositoryInterface::class, SolarForecastRepository::class);
+        $this->app->bind(ConsumptionReadingRepositoryInterface::class, ConsumptionReadingRepository::class);
     }
 
     private function bindSolaxClient(): void
@@ -71,17 +81,6 @@ class AppServiceProvider extends ServiceProvider
         );
     }
 
-    private function bindForecastSolarClient(): void
-    {
-        $this->app->bind(
-            ForecastSolarClientInterface::class,
-            fn () => new ForecastSolarClient(
-                latitude:  (float) config('solar.location.latitude'),
-                longitude: (float) config('solar.location.longitude'),
-            ),
-        );
-    }
-
     private function bindOpenMeteoClient(): void
     {
         $this->app->bind(
@@ -98,20 +97,9 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(
             RecommendationInputAssembler::class,
             fn ($app) => new RecommendationInputAssembler(
-                solax:         $app->make(SolaxClientInterface::class),
-                octopus:       $app->make(OctopusClientInterface::class),
-                forecastSolar: $app->make(ForecastSolarClientInterface::class),
-                openMeteo:     $app->make(OpenMeteoClientInterface::class),
-                solarArrays:   array_map(
-                    fn (array $arr) => new SolarArrayDTO(
-                        name:    (string) $arr['name'],
-                        kwp:     (float)  $arr['kwp'],
-                        azimuth: (int)    $arr['azimuth'],
-                        tilt:    (int)    $arr['tilt'],
-                    ),
-                    config('solar.arrays'),
-                ),
-                totalKwp: (float) config('solar.total_kwp'),
+                batteryRepo:     $app->make(BatteryReadingRepositoryInterface::class),
+                forecastRepo:    $app->make(SolarForecastRepositoryInterface::class),
+                consumptionRepo: $app->make(ConsumptionReadingRepositoryInterface::class),
             ),
         );
     }
