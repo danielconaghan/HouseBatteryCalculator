@@ -6,6 +6,7 @@
         "php": "^8.5",
         "laravel/framework": "^12.0",
         "laravel/sanctum": "^4.0",
+        "predis/predis": "*",
         "spatie/laravel-data": "^4.0"
     },
     "require-dev": {

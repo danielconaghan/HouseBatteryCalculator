@@ -78,6 +78,7 @@ services:
       DB_PASSWORD: ${MYSQL_PASSWORD:-password}
       CACHE_STORE: redis
       QUEUE_CONNECTION: redis
+      REDIS_CLIENT: predis
       REDIS_HOST: redis
       REDIS_PORT: 6379
       ENERGY_SERVICE_URL: http://energy-service:8000

@@ -4,7 +4,11 @@ An internet-facing solar battery charging optimisation service for a residential
 
 **Installation:** SolaX X1-HYBRID-6.0-D (6kW) inverter · 2× SolaX T-BAT H 5.8 (11.6kWh total, 8.1kWh usable) · 19 panels / 7.6kWp
 
-### Example recommendation
+### Dashboard
+
+![Dashboard showing a Do Not Charge recommendation with 90% confidence](docs/dashboard.png)
+
+### Example API response
 
 ```json
 {
@@ -80,15 +84,16 @@ worker  (Laravel queue worker + scheduler — runs inside energy-service codebas
 - Docker Desktop ≥ 4.x
 - Docker Compose v2
 
-### 1. Clone and configure
+### 1. Clone and copy environment files
 
 ```bash
 git clone <repo-url> HouseBatteryCalculator
 cd HouseBatteryCalculator
 cp .env.example .env
+cp energy-bff/.env.example energy-bff/.env
 ```
 
-Edit `.env` and fill in your credentials:
+Edit the **root `.env`** and fill in your API credentials:
 
 | Variable | Where to find it |
 |---|---|
@@ -99,33 +104,39 @@ Edit `.env` and fill in your credentials:
 | `OCTOPUS_MPAN` | Your electricity meter (on bill or account page) |
 | `OCTOPUS_SERIAL_NUMBER` | Your smart meter serial (on bill or account page) |
 
+The `energy-bff/.env` file controls auth and does not need secrets — just an app key (generated in the next step).
+
 ### 2. Build and start
 
 ```bash
 make build
 ```
 
-This builds all images and starts all containers. MySQL creates both databases on first boot.
+Builds all images, starts all containers, and runs `composer install` inside the PHP containers. MySQL initialises both databases on first boot.
 
-### 3. Run migrations
+### 3. Generate the BFF app key
+
+```bash
+make key-bff
+```
+
+This writes a fresh `APP_KEY` directly into `energy-bff/.env`. Only needed once on a fresh install.
+
+### 4. Run migrations
 
 ```bash
 make migrate
 ```
 
-### 4. Seed a user account
+### 5. Create your user account
 
 ```bash
-docker compose exec energy-bff php artisan tinker --execute="
-App\Models\User::create([
-    'name'     => 'Admin',
-    'email'    => 'admin@example.com',
-    'password' => bcrypt('your-password'),
-]);
-"
+make user EMAIL=you@example.com PASSWORD=yourpassword NAME="Your Name"
 ```
 
-### 5. Open the dashboard
+`NAME` defaults to `Admin` if omitted. The command is idempotent — safe to re-run.
+
+### 6. Open the dashboard
 
 Visit [http://localhost:3000](http://localhost:3000).
 
@@ -136,20 +147,32 @@ The worker begins collecting data immediately on startup. Battery state appears 
 ## Common Commands
 
 ```bash
-make up              # Start all containers (no rebuild)
-make down            # Stop all containers
-make build           # Rebuild images and start
+# Stack
+make up              # Start all containers (no rebuild, data preserved)
+make down            # Stop all containers (data preserved in volumes)
+make down-clean      # Stop and delete all volumes — full wipe, use with care
+make build           # Rebuild images, start, and run composer install
+make restart         # Restart all containers
 make logs            # Tail all container logs
 make worker-logs     # Tail only the worker (data collection + scheduler)
 make ps              # Show container status
-make migrate         # Run pending migrations on both services
-make fresh           # Drop all tables and re-migrate (dev only)
-make test            # Run all test suites
 
-# Trigger data collection immediately (useful for debugging)
-make fetch-battery
-make fetch-forecast
-make fetch-consumption
+# Database
+make migrate         # Run pending migrations on both services
+make fresh           # Drop and re-migrate both databases (dev only)
+
+# Setup (first-run only)
+make key-bff         # Generate and write APP_KEY into energy-bff/.env
+make user EMAIL=you@example.com PASSWORD=secret NAME="Your Name"
+
+# Tests
+make test            # Run all test suites (energy-service, energy-bff, energy-ui)
+
+# Data collection — trigger immediately rather than waiting for the scheduler
+make fetch-battery      # Dispatch FetchBatteryStateJob now
+make fetch-forecast     # Dispatch FetchSolarForecastJob now
+make fetch-consumption  # Dispatch FetchConsumptionJob now
+make fetch-all          # Dispatch all three at once
 ```
 
 ---
