@@ -2,6 +2,9 @@
 .env
 *.env.local
 
+# PHPUnit
+**/.phpunit.result.cache
+
 # Laravel
 */vendor/
 */bootstrap/cache/*

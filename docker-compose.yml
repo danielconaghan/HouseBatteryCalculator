@@ -24,6 +24,7 @@ services:
       DB_PASSWORD: ${MYSQL_PASSWORD:-password}
       CACHE_STORE: redis
       QUEUE_CONNECTION: redis
+      REDIS_CLIENT: predis
       REDIS_HOST: redis
       REDIS_PORT: 6379
       SOLAX_TOKEN_ID: ${SOLAX_TOKEN_ID}
@@ -82,6 +83,62 @@ services:
       ENERGY_SERVICE_URL: http://energy-service:8000
       SANCTUM_STATEFUL_DOMAINS: localhost:3000
       FRONTEND_URL: http://localhost:3000
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      energy-service:
+        condition: service_started
+    networks:
+      - solar
+
+  # ---------------------------------------------------------------------------
+  # worker — Laravel queue worker + scheduler for energy-service
+  # Runs scheduled data-collection jobs (battery every 15 min, forecast daily,
+  # consumption every hour) and processes the Redis job queue.
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./energy-service
+      dockerfile: Dockerfile
+    command: sh -c "php artisan queue:work --sleep=3 --tries=3 --max-time=3600 & php artisan schedule:work"
+    volumes:
+      - ./energy-service:/var/www/html
+      - /var/www/html/vendor
+    environment:
+      APP_ENV: local
+      APP_KEY: ${ENERGY_SERVICE_APP_KEY}
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: energy_service
+      DB_USERNAME: ${MYSQL_USER:-sail}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-password}
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SOLAX_TOKEN_ID: ${SOLAX_TOKEN_ID}
+      SOLAX_WIFI_SN: ${SOLAX_WIFI_SN}
+      SOLAX_BASE_URL: ${SOLAX_BASE_URL:-https://global.solaxcloud.com}
+      OCTOPUS_API_KEY: ${OCTOPUS_API_KEY}
+      OCTOPUS_ACCOUNT_NUMBER: ${OCTOPUS_ACCOUNT_NUMBER}
+      OCTOPUS_MPAN: ${OCTOPUS_MPAN}
+      OCTOPUS_SERIAL_NUMBER: ${OCTOPUS_SERIAL_NUMBER}
+      OCTOPUS_BASE_URL: ${OCTOPUS_BASE_URL:-https://api.octopus.energy}
+      OCTOPUS_CHEAP_RATE_PENCE: ${OCTOPUS_CHEAP_RATE_PENCE:-7.5}
+      OCTOPUS_DAY_RATE_PENCE: ${OCTOPUS_DAY_RATE_PENCE:-24.0}
+      OCTOPUS_CHEAP_START: ${OCTOPUS_CHEAP_START:-23:30}
+      OCTOPUS_CHEAP_END: ${OCTOPUS_CHEAP_END:-05:30}
+      BATTERY_TOTAL_CAPACITY_KWH: ${BATTERY_TOTAL_CAPACITY_KWH:-11.6}
+      BATTERY_USABLE_CAPACITY_KWH: ${BATTERY_USABLE_CAPACITY_KWH:-8.1}
+      BATTERY_CHARGE_CEILING_PCT: ${BATTERY_CHARGE_CEILING_PCT:-70}
+      BATTERY_CHARGE_RATE_KW: ${BATTERY_CHARGE_RATE_KW:-3.5}
+      SOLAR_LATITUDE: ${SOLAR_LATITUDE:-51.7}
+      SOLAR_LONGITUDE: ${SOLAR_LONGITUDE:--2.2}
+      SOLAR_GROUP5_AZIMUTH: ${SOLAR_GROUP5_AZIMUTH:-181}
     depends_on:
       mysql:
         condition: service_healthy

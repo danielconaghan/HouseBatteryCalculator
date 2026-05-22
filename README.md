@@ -1,9 +1,33 @@
 # Solar Energy Optimisation
 
-A residential solar battery charging optimisation system.
-Each evening it decides whether to charge the home battery from the grid on the cheap overnight tariff, or whether tomorrow's forecast solar generation makes that unnecessary.
+An internet-facing solar battery charging optimisation service for a residential installation. It collects live data from external APIs on a schedule, stores it locally, and serves real-time charge recommendations to authenticated users via a React dashboard.
 
-**Installation:** SolaX X1-HYBRID-6.0-D (6kW) inverter · 2× SolaX T-BAT H 5.8 (11.6kWh total, 8.1kWh usable) · 19 panels / 7.6kWp · Nailsworth, Gloucestershire
+**Installation:** SolaX X1-HYBRID-6.0-D (6kW) inverter · 2× SolaX T-BAT H 5.8 (11.6kWh total, 8.1kWh usable) · 19 panels / 7.6kWp
+
+### Example recommendation
+
+```json
+{
+  "data": {
+    "action": "DO_NOT_CHARGE",
+    "target_charge_pct": 98,
+    "target_charge_kwh": 11.37,
+    "confidence": 0.9,
+    "reasoning": {
+      "forecast_generation_kwh": 43.867,
+      "forecast_consumption_kwh": 10,
+      "current_battery_kwh": 11.37,
+      "gap_kwh": -45.237,
+      "factors": [
+        "Forecast: 43.87 kWh generation, 10.00 kWh consumption, -45.24 kWh charge gap",
+        "Input data is stale (factor: 34%) — confidence reduced"
+      ]
+    },
+    "generated_at": "2026-05-22T08:54:39+00:00",
+    "valid_until": "2026-05-22T16:54:39+00:00"
+  }
+}
+```
 
 ---
 
@@ -12,33 +36,40 @@ Each evening it decides whether to charge the home battery from the grid on the 
 ```
 energy-ui  (React SPA)
     │
-    │  HTTP  (auth via Sanctum)
+    │  HTTP  (Sanctum token auth)
     ▼
 energy-bff  (Laravel — aggregation + auth only, no business logic)
     │
     │  HTTP
     ▼
-energy-service  (Laravel — optimisation engine, all external integrations)
+energy-service  (Laravel — optimisation engine, scheduled data collection)
     │
-    ├── SolaxCloud API      (battery state, inverter telemetry)
-    ├── Octopus Energy API  (tariff rates, consumption history)
-    ├── Forecast.solar API  (generation forecast per array plane)
-    └── Open-Meteo API      (weather / cloud cover)
+    ├── SolaxCloud API      (battery state — fetched every 15 min by worker)
+    ├── Octopus Energy API  (consumption history — fetched hourly by worker)
+    └── Open-Meteo API      (solar radiation forecast — fetched daily by worker)
+
+worker  (Laravel queue worker + scheduler — runs inside energy-service codebase)
+    ├── FetchBatteryStateJob   → every 15 minutes → battery_readings table
+    ├── FetchSolarForecastJob  → daily at 06:00   → solar_forecasts table
+    └── FetchConsumptionJob    → every hour       → consumption_readings table
 ```
 
-**Rule:** The frontend never talks to energy-service directly. The BFF contains no business logic.
+**Key rule:** External APIs are never called during a web request. The recommendation engine reads from the database only. The worker collects data independently in the background.
+
+**Frontend rule:** The UI never talks to energy-service directly. All traffic goes through the BFF.
 
 ---
 
 ## Services and Ports
 
-| Service        | Description                    | Local Port |
-|----------------|--------------------------------|------------|
-| energy-service | Optimisation engine            | 8001       |
-| energy-bff     | Backend for Frontend           | 8002       |
-| energy-ui      | React SPA (dev server)         | 3000       |
-| MySQL 8        | Databases (energy_service, energy_bff) | 3307 |
-| Redis 7        | Cache and queues               | 6379       |
+| Service        | Description                              | Local Port |
+|----------------|------------------------------------------|------------|
+| energy-service | Optimisation engine + REST API           | 8001       |
+| energy-bff     | Backend for Frontend (auth + aggregation)| 8002       |
+| energy-ui      | React SPA (Vite dev server)              | 3000       |
+| worker         | Queue worker + scheduler (no HTTP port)  | —          |
+| MySQL 8        | Databases (energy_service, energy_bff)   | 3307       |
+| Redis 7        | Cache and job queue                      | 6379       |
 
 ---
 
@@ -49,86 +80,91 @@ energy-service  (Laravel — optimisation engine, all external integrations)
 - Docker Desktop ≥ 4.x
 - Docker Compose v2
 
-### 1. Clone and configure environment
+### 1. Clone and configure
 
 ```bash
-git clone <repo-url> solar
-cd solar
-
-# Copy and fill in credentials for each service
-cp energy-service/.env.example energy-service/.env
-cp energy-bff/.env.example      energy-bff/.env
-cp energy-ui/.env.example       energy-ui/.env
+git clone <repo-url> HouseBatteryCalculator
+cd HouseBatteryCalculator
+cp .env.example .env
 ```
 
-Edit `energy-service/.env` and supply your API keys:
+Edit `.env` and fill in your credentials:
 
-| Variable | Where to get it |
+| Variable | Where to find it |
 |---|---|
-| `SOLAX_API_KEY` | SolaxCloud portal → Account → API |
-| `SOLAX_TOKEN_ID` | SolaxCloud portal |
-| `SOLAX_SERIAL_NUMBER` | Inverter label or SolaxCloud |
-| `OCTOPUS_API_KEY` | Octopus dashboard → API access |
+| `SOLAX_TOKEN_ID` | SolaxCloud portal → Service → API → Token Management |
+| `SOLAX_WIFI_SN` | Wi-Fi dongle label (the dongle SN, not the inverter SN) |
+| `OCTOPUS_API_KEY` | octopus.energy/dashboard/developer |
 | `OCTOPUS_ACCOUNT_NUMBER` | Your Octopus account page |
-| `OCTOPUS_MPAN` | Your electricity meter |
-
-Edit `energy-bff/.env` and generate an app key:
-
-```bash
-# You can run this once the containers are up — see step 3
-php artisan key:generate
-```
+| `OCTOPUS_MPAN` | Your electricity meter (on bill or account page) |
+| `OCTOPUS_SERIAL_NUMBER` | Your smart meter serial (on bill or account page) |
 
 ### 2. Build and start
 
 ```bash
-docker compose up --build
+make build
 ```
 
-This starts all five containers. MySQL runs its init script on first start, creating both databases.
+This builds all images and starts all containers. MySQL creates both databases on first boot.
 
-### 3. Initialise Laravel services
-
-In two separate terminals (or use `docker compose exec`):
+### 3. Run migrations
 
 ```bash
-# energy-service
-docker compose exec energy-service php artisan key:generate
-docker compose exec energy-service php artisan migrate
-
-# energy-bff
-docker compose exec energy-bff php artisan key:generate
-docker compose exec energy-bff php artisan migrate
+make migrate
 ```
 
-### 4. Open the UI
+### 4. Seed a user account
+
+```bash
+docker compose exec energy-bff php artisan tinker --execute="
+App\Models\User::create([
+    'name'     => 'Admin',
+    'email'    => 'admin@example.com',
+    'password' => bcrypt('your-password'),
+]);
+"
+```
+
+### 5. Open the dashboard
 
 Visit [http://localhost:3000](http://localhost:3000).
 
+The worker begins collecting data immediately on startup. Battery state appears within 15 minutes; the solar forecast appears after 06:00 the next morning; consumption history is backfilled from Octopus over the first hourly run.
+
 ---
 
-## Development
-
-### Running tests
+## Common Commands
 
 ```bash
-# energy-service unit and feature tests
-docker compose exec energy-service php artisan test
+make up              # Start all containers (no rebuild)
+make down            # Stop all containers
+make build           # Rebuild images and start
+make logs            # Tail all container logs
+make worker-logs     # Tail only the worker (data collection + scheduler)
+make ps              # Show container status
+make migrate         # Run pending migrations on both services
+make fresh           # Drop all tables and re-migrate (dev only)
+make test            # Run all test suites
 
-# energy-bff unit and feature tests
-docker compose exec energy-bff php artisan test
-
-# energy-ui type checking and tests
-docker compose exec energy-ui npm run type-check
-docker compose exec energy-ui npm run test
+# Trigger data collection immediately (useful for debugging)
+make fetch-battery
+make fetch-forecast
+make fetch-consumption
 ```
 
-### Linting
+---
+
+## Running Tests
 
 ```bash
-docker compose exec energy-service vendor/bin/pint
-docker compose exec energy-bff     vendor/bin/pint
-docker compose exec energy-ui      npm run lint
+# All suites at once
+make test
+
+# Individual
+docker compose exec energy-service php artisan test
+docker compose exec energy-bff     php artisan test
+docker compose exec energy-ui      npm run test
+docker compose exec energy-ui      npm run type-check
 ```
 
 ---
@@ -136,57 +172,44 @@ docker compose exec energy-ui      npm run lint
 ## Directory Structure
 
 ```
-solar/
-├── docker-compose.yml
+HouseBatteryCalculator/
+├── .env.example              # Template — copy to .env and fill in secrets
+├── docker-compose.yml        # All services defined here
+├── Makefile                  # Common commands (up, down, migrate, test, etc.)
 ├── docker/
-│   └── mysql/
-│       └── init.sql          # Creates both databases on first boot
-├── energy-service/           # Optimisation engine (Laravel 11)
+│   └── mysql/init.sql        # Creates energy_service + energy_bff databases
+├── energy-service/           # Optimisation engine (Laravel 12, PHP 8.5)
 │   ├── app/
-│   │   ├── Actions/          # Single-purpose action classes
+│   │   ├── Actions/          # Pure business logic (CalculateChargeRecommendationAction)
 │   │   ├── DTOs/             # Typed data transfer objects (spatie/laravel-data)
 │   │   ├── Enums/            # PHP 8.1 backed enums
-│   │   ├── Http/
-│   │   │   ├── Controllers/Api/V1/
-│   │   │   ├── Requests/     # Form Request validation
-│   │   │   └── Resources/    # API Resource responses
-│   │   ├── Providers/
-│   │   └── Services/
-│   │       └── Contracts/    # Interfaces for external API clients
-│   ├── config/
-│   │   ├── battery.php       # Capacity, ceiling %, charge rate
-│   │   ├── octopus.php       # Tariff rates, API config
-│   │   ├── solar.php         # Panel arrays, location
-│   │   └── solax.php         # Inverter API config
-│   └── routes/api.php        # /api/v1/...
-├── energy-bff/               # Backend for Frontend (Laravel 11)
-│   ├── app/
-│   │   ├── DTOs/
-│   │   ├── Http/
-│   │   │   ├── Controllers/Api/V1/
-│   │   │   ├── Middleware/
-│   │   │   └── Resources/
-│   │   ├── Providers/
-│   │   └── Services/         # energy-service HTTP client
-│   ├── config/
-│   │   └── services.php      # Upstream service URLs
-│   └── routes/api.php        # /api/v1/...
-└── energy-ui/                # React SPA (Vite + TypeScript)
+│   │   ├── Jobs/             # Scheduled data-collection jobs
+│   │   ├── Models/           # Eloquent models (thin — repositories own logic)
+│   │   ├── Repositories/     # DB read/write behind interfaces
+│   │   ├── Services/         # External API clients (behind interfaces)
+│   │   └── Http/Controllers/ # API endpoints
+│   ├── database/migrations/  # battery_readings, solar_forecasts, consumption_readings
+│   └── routes/
+│       ├── api.php           # GET /api/v1/recommendation
+│       └── console.php       # Scheduled job definitions
+├── energy-bff/               # Backend for Frontend (Laravel 12, PHP 8.5)
+│   └── ...                   # Auth, proxy to energy-service
+└── energy-ui/                # React 18 SPA (TypeScript strict, Vite 5, Tailwind CSS v4)
     └── src/
-        ├── api/              # Typed API client — components never call fetch
-        ├── components/       # Shared UI components
-        ├── features/         # Co-located feature modules
-        ├── hooks/            # Custom hooks (logic lives here, not in components)
-        └── types/            # Shared TypeScript types
+        ├── api/              # Typed BFF client
+        ├── features/         # Co-located feature modules (auth, dashboard)
+        └── hooks/            # Custom hooks (logic lives here, not in components)
 ```
 
 ---
 
 ## Key Design Decisions
 
-- **Battery charge ceiling is 70%** (`BATTERY_CHARGE_CEILING_PCT`). This is a longevity decision to extend cell life — not a technical limit. It is always a named constant, never a magic number.
-- **Conservative by default.** If forecast data is missing or confidence is low, the system recommends charging to ceiling. A missed solar day costs ~£0.50; a flat battery is worse.
-- **Versioned API from day one.** All endpoints are under `/api/v1/` even though v2 does not yet exist.
+- **Data collection is decoupled from web requests.** The `worker` container runs scheduled jobs that fetch from external APIs and store results in the database. The recommendation controller reads from the database only — no external calls on the request path.
+- **Conservative by default.** If data is missing or stale, the system recommends charging to ceiling. A missed solar day costs ~£0.50; a flat battery is worse.
+- **Solar generation derived from Open-Meteo.** We use `shortwave_radiation_sum` (MJ/m²) × total kWp × performance ratio (0.78) to estimate daily generation. No Forecast.solar rate limits in production.
+- **Battery charge ceiling is 70%** (`BATTERY_CHARGE_CEILING_PCT`). Longevity decision — always a named constant, never a magic number.
+- **Versioned API from day one.** All endpoints are under `/api/v1/`.
 - **No cross-service database access.** Each service owns its own database schema entirely.
 
 ---
