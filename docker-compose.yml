@@ -20,12 +20,31 @@ services:
       DB_HOST: mysql
       DB_PORT: 3306
       DB_DATABASE: energy_service
-      DB_USERNAME: sail
-      DB_PASSWORD: password
+      DB_USERNAME: ${MYSQL_USER:-sail}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-password}
       CACHE_STORE: redis
       QUEUE_CONNECTION: redis
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      SOLAX_TOKEN_ID: ${SOLAX_TOKEN_ID}
+      SOLAX_WIFI_SN: ${SOLAX_WIFI_SN}
+      SOLAX_BASE_URL: ${SOLAX_BASE_URL:-https://global.solaxcloud.com}
+      OCTOPUS_API_KEY: ${OCTOPUS_API_KEY}
+      OCTOPUS_ACCOUNT_NUMBER: ${OCTOPUS_ACCOUNT_NUMBER}
+      OCTOPUS_MPAN: ${OCTOPUS_MPAN}
+      OCTOPUS_SERIAL_NUMBER: ${OCTOPUS_SERIAL_NUMBER}
+      OCTOPUS_BASE_URL: ${OCTOPUS_BASE_URL:-https://api.octopus.energy}
+      OCTOPUS_CHEAP_RATE_PENCE: ${OCTOPUS_CHEAP_RATE_PENCE:-7.5}
+      OCTOPUS_DAY_RATE_PENCE: ${OCTOPUS_DAY_RATE_PENCE:-24.0}
+      OCTOPUS_CHEAP_START: ${OCTOPUS_CHEAP_START:-23:30}
+      OCTOPUS_CHEAP_END: ${OCTOPUS_CHEAP_END:-05:30}
+      BATTERY_TOTAL_CAPACITY_KWH: ${BATTERY_TOTAL_CAPACITY_KWH:-11.6}
+      BATTERY_USABLE_CAPACITY_KWH: ${BATTERY_USABLE_CAPACITY_KWH:-8.1}
+      BATTERY_CHARGE_CEILING_PCT: ${BATTERY_CHARGE_CEILING_PCT:-70}
+      BATTERY_CHARGE_RATE_KW: ${BATTERY_CHARGE_RATE_KW:-3.5}
+      SOLAR_LATITUDE: ${SOLAR_LATITUDE:-51.7}
+      SOLAR_LONGITUDE: ${SOLAR_LONGITUDE:--2.2}
+      SOLAR_GROUP5_AZIMUTH: ${SOLAR_GROUP5_AZIMUTH:-181}
     depends_on:
       mysql:
         condition: service_healthy
@@ -54,8 +73,8 @@ services:
       DB_HOST: mysql
       DB_PORT: 3306
       DB_DATABASE: energy_bff
-      DB_USERNAME: sail
-      DB_PASSWORD: password
+      DB_USERNAME: ${MYSQL_USER:-sail}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-password}
       CACHE_STORE: redis
       QUEUE_CONNECTION: redis
       REDIS_HOST: redis
@@ -87,7 +106,7 @@ services:
       - ./energy-ui:/app
       - /app/node_modules
     environment:
-      VITE_BFF_URL: http://localhost:8002
+      VITE_BFF_URL: http://energy-bff:8000
     depends_on:
       - energy-bff
     networks:
@@ -102,9 +121,9 @@ services:
     ports:
       - "3307:3306"
     environment:
-      MYSQL_ROOT_PASSWORD: root_password
-      MYSQL_USER: sail
-      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password}
+      MYSQL_USER: ${MYSQL_USER:-sail}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-password}
     volumes:
       - mysql_data:/var/lib/mysql
       - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro

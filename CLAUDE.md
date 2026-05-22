@@ -4,8 +4,8 @@
 
 | Layer          | Technology                                      |
 |----------------|-------------------------------------------------|
-| energy-service | Laravel 11, PHP 8.5                             |
-| energy-bff     | Laravel 11, PHP 8.5                             |
+| energy-service | Laravel 12, PHP 8.5                             |
+| energy-bff     | Laravel 12, PHP 8.5                             |
 | energy-ui      | React 18, TypeScript 5 (strict), Vite 5         |
 | Testing (PHP)  | PHPUnit 11, spatie/laravel-data 4               |
 | Testing (UI)   | Vitest 2, React Testing Library                 |
@@ -15,14 +15,14 @@
 
 ## What This Is
 
-A solar battery charging optimisation system for a residential
-installation. The system decides each evening whether to charge
-the home battery from the grid on a cheap overnight tariff, or
-whether forecast solar generation makes that unnecessary.
+An internet-facing solar battery charging optimisation service for a
+residential installation. It runs continuously, collects data from
+external APIs on a schedule, and serves a real-time dashboard and
+charge recommendation to authenticated users.
 
 Three components:
-- **energy-service** — the brain. All external integrations and
-  optimisation logic.
+- **energy-service** — the brain. All external integrations,
+  scheduled data collection, and optimisation logic.
 - **energy-bff** — Backend for Frontend. Aggregates
   energy-service, handles auth, serves the frontend only.
 - **energy-ui** — React SPA. Talks only to the BFF. Never
@@ -66,11 +66,14 @@ Total: 19 panels, 7.6kWp
 |----------------|--------------------------------------|---------------|
 | SolaxCloud      | Battery state, generation, inverter  | tokenId header |
 | Octopus Energy  | Tariff rates, consumption history    | Basic auth    |
-| Forecast.solar  | Generation forecast per array plane  | None (free)   |
-| Open-Meteo      | Weather / cloud cover forecast       | None          |
+| Open-Meteo      | Solar radiation + weather forecast   | None          |
 
 All API keys via environment variables. Never in code.
 Never in version control. Always in `.env` (gitignored).
+
+**Forecast.solar is NOT used.** Solar generation is derived from
+Open-Meteo radiation data using the PV physics formula. This gives
+no rate limits, no auth, and no third-party dependency in production.
 
 ### SolaxCloud API (v2) — Implementation Notes
 
@@ -100,24 +103,63 @@ Never in version control. Always in `.env` (gitignored).
 - **Paginated:** follow `next` URL in response until `null`. Cap at 50 pages.
 - **Reading fields:** `consumption` (kWh), `interval_start`, `interval_end` (ISO 8601 UTC)
 
-### Forecast.solar API — Implementation Notes
-
-- **Endpoint:** `GET https://api.forecast.solar/estimate/{lat}/{lon}/{dec}/{az}/{kwp}`
-  — all params are **URL path segments**, not query params
-- **Azimuth convention:** degrees from South (South=0, East=−90, West=+90, North=±180)
-  Our config stores compass bearing (South=181, East=90, West=270).
-  **Convert:** `api_az = compass_bearing − 180`
-- **Response:** `result.watt_hours_day` — dict of `"YYYY-MM-DD"` → daily Wh total
-- **`result.watt_hours_period`** — dict of `"YYYY-MM-DD HH:MM:SS"` → Wh per period
-  (used for divergence calculation against Open-Meteo)
-- **Rate limit:** 12 req/hour free tier — we make 5 calls per cycle (one per array)
-
 ### Open-Meteo API — Implementation Notes
 
 - **Endpoint:** `GET https://api.open-meteo.com/v1/forecast`
-- **Key params:** `latitude`, `longitude`, `daily=cloud_cover_mean,shortwave_radiation_sum`,
+- **Key params:** `latitude`, `longitude`,
+  `daily=shortwave_radiation_sum,cloud_cover_mean`,
+  `hourly=shortwave_radiation,direct_radiation`,
   `start_date=YYYY-MM-DD`, `end_date=YYYY-MM-DD`, `timezone=Europe/London`
-- **Response:** `daily.cloud_cover_mean[0]` (%), `daily.shortwave_radiation_sum[0]` (MJ/m²)
+- **Response:** `daily.shortwave_radiation_sum[0]` (MJ/m²),
+  `daily.cloud_cover_mean[0]` (%)
+- **Solar generation derivation:**
+  ```
+  radiation_kwh_m2 = shortwave_radiation_sum_MJ_m2 / 3.6
+  estimated_kwh    = system_kwp * radiation_kwh_m2 * performance_ratio
+  ```
+  Performance ratio for this installation: **0.78**
+  (accounts for inverter efficiency, wiring losses, temperature derating)
+- This is calculated **per array group** using each group's kWp, then summed.
+- Cloud cover > 60% degrades confidence in the forecast.
+
+---
+
+## Data Collection Architecture
+
+**External APIs are NEVER called during a web request.**
+
+All external data is collected by scheduled background jobs and stored
+in the database. The recommendation engine reads from the database only.
+
+```
+Scheduled Jobs (Laravel Scheduler)          Web Requests
+──────────────────────────────────          ────────────────────────
+FetchBatteryStateJob   — every 15 min  →  battery_readings table
+FetchSolarForecastJob  — daily @ 06:00 →  solar_forecasts table
+FetchConsumptionJob    — every hour    →  consumption_readings table
+                                               ↓
+                                          CalculateChargeRecommendationAction
+                                          reads latest cached values only —
+                                          zero external calls per request
+```
+
+### Stored data models
+- **`battery_readings`** — soc, charge_kwh, bat_power_w, inverter_status, fetched_at
+- **`solar_forecasts`** — forecast_date, estimated_kwh, radiation_kwh_m2,
+  cloud_cover_pct, generated_at
+- **`consumption_readings`** — interval_start, interval_end, consumption_kwh
+
+### Staleness handling
+If the latest reading is older than its expected refresh interval, the
+recommendation engine **degrades confidence** rather than failing.
+Thresholds:
+- Battery state stale after **30 minutes** → confidence penalty
+- Solar forecast stale after **25 hours** → confidence penalty
+- Consumption stale after **3 hours** → confidence penalty
+
+It never throws a 503 because a scheduled job hasn't run yet —
+it returns a recommendation with a lower confidence score and includes
+a `stale_data` factor in the reasoning.
 
 ---
 
@@ -286,22 +328,26 @@ There is no "we'll clean it up later." Write it right first time.
    from config. Nothing about the installation is hardcoded
    in logic.
 
+6. **External APIs are never called during a web request.**
+   All external data is collected by scheduled background jobs
+   and persisted to the database. The recommendation controller
+   reads from the database only. This is non-negotiable for an
+   internet-facing service.
+
 ---
 
 ## Optimisation Logic (Domain Knowledge)
 
-The core question answered each evening (~21:00):
+The core question, answered on demand from cached data:
 
-> Given current battery state, forecast solar generation
-> tomorrow, and expected consumption, should I charge tonight
-> and to what level?
+> Given the latest battery state, tomorrow's solar generation forecast,
+> and expected consumption, should I charge tonight and to what level?
 
-### Inputs
-- Current battery state (% and kWh) from SolaxCloud
-- Tomorrow's generation forecast per array from Forecast.solar
-- Weather / cloud cover from Open-Meteo (validation layer)
-- Historical consumption by hour/day-of-week from Octopus
-- Current tariff rates from Octopus
+### Inputs (all read from database — never fetched live)
+- Latest battery state from `battery_readings` (collected every 15 min)
+- Tomorrow's generation forecast from `solar_forecasts` (collected daily)
+- Historical consumption by hour/day-of-week from `consumption_readings`
+- Current tariff rates from config (Octopus rates are config, not dynamic)
 
 ### Decision Logic
 ```
@@ -318,7 +364,7 @@ else:
 
 Confidence is degraded when:
 - Cloud cover forecast > 60%
-- Forecast.solar and Open-Meteo disagree significantly
+- Any input data is stale (beyond its refresh threshold)
 - Consumption history has high variance for this day/season
 
 ### Output (typed DTO)
@@ -357,6 +403,8 @@ When Claude Code is doing this well:
   defaults (charge to ceiling if in doubt).
 - The recommendation is always explainable in plain English,
   because the reasoning DTO contains everything needed.
+- Scheduled jobs fail loudly (logged, alerted) but
+  independently — one job failing does not affect others.
 
 ## When In Doubt
 

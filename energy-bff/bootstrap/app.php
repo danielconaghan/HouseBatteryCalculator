@@ -5,6 +5,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
@@ -17,6 +18,12 @@ return Application::configure(basePath: dirname(__DIR__))
     })
     ->withExceptions(function (Exceptions $exceptions) {
         $exceptions->render(function (EnergyServiceException $e, Request $request) {
+            Log::error('Energy service unavailable', [
+                'message'     => $e->getMessage(),
+                'status_code' => $e->getCode(),
+                'path'        => $request->path(),
+            ]);
+
             return response()->json([
                 'error' => [
                     'code'    => 'ENERGY_SERVICE_UNAVAILABLE',

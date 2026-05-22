@@ -27,8 +27,12 @@ class EnergyServiceClient implements EnergyServiceClientInterface
         }
 
         if (! $response->successful()) {
+            $body            = $response->json('error') ?? [];
+            $upstreamCode    = $body['code'] ?? 'UNKNOWN';
+            $upstreamMessage = $body['message'] ?? 'no message';
+
             throw new EnergyServiceException(
-                'Energy service returned an error',
+                sprintf('[%s] %s (HTTP %d)', $upstreamCode, $upstreamMessage, $response->status()),
                 $response->status(),
             );
         }
