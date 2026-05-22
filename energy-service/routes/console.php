@@ -2,14 +2,11 @@
 
 declare(strict_types=1);
 
+use App\Jobs\FetchBatteryStateJob;
+use App\Jobs\FetchConsumptionJob;
+use App\Jobs\FetchSolarForecastJob;
 use Illuminate\Support\Facades\Schedule;
 
-/*
-|--------------------------------------------------------------------------
-| Console Routes — energy-service
-|--------------------------------------------------------------------------
-|
-| Scheduled commands will be registered here.
-| e.g. Schedule::command('recommendation:generate')->dailyAt('21:00');
-|
-*/
+Schedule::job(FetchBatteryStateJob::class)->everyFifteenMinutes();
+Schedule::job(new FetchSolarForecastJob(totalKwp: (float) config('solar.total_kwp')))->dailyAt('06:00');
+Schedule::job(FetchConsumptionJob::class)->hourly();
