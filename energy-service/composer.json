@@ -3,8 +3,8 @@
     "description": "Solar battery optimisation engine — external integrations and recommendation logic",
     "type": "project",
     "require": {
-        "php": "^8.3",
-        "laravel/framework": "^11.0",
+        "php": "^8.5",
+        "laravel/framework": "^12.0",
         "laravel/sanctum": "^4.0",
         "spatie/laravel-data": "^4.0"
     },

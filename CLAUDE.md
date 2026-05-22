@@ -4,8 +4,8 @@
 
 | Layer          | Technology                                      |
 |----------------|-------------------------------------------------|
-| energy-service | Laravel 11, PHP 8.3                             |
-| energy-bff     | Laravel 11, PHP 8.3                             |
+| energy-service | Laravel 11, PHP 8.5                             |
+| energy-bff     | Laravel 11, PHP 8.5                             |
 | energy-ui      | React 18, TypeScript 5 (strict), Vite 5         |
 | Testing (PHP)  | PHPUnit 11, spatie/laravel-data 4               |
 | Testing (UI)   | Vitest 2, React Testing Library                 |
